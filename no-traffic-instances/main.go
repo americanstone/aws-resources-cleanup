@@ -5,6 +5,7 @@ import (
 	//"flag"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,6 +21,8 @@ var namespace string
 var dimensionName string
 var diffInMinutes int
 var period int
+var startTime *time.Time
+var endTime *time.Time
 
 func init() {
 	id = "inst"
@@ -28,24 +31,21 @@ func init() {
 	dimensionName = "InstanceId"
 	diffInMinutes = 10800 // minutes 7.5 days
 	period = 86400        // 24 hours
+	startTime = aws.Time(time.Unix(time.Now().Add(time.Duration(-diffInMinutes)*time.Minute).Unix(), 0))
+	endTime = aws.Time(time.Unix(time.Now().Unix(), 0))
+	fmt.Printf("Request startTime %v endTime %v \n", startTime, endTime)
 }
 
-// EC2DescribeInstancesAPI defines the interface for the DescribeInstances function.
-// We use this interface to test the function using a mocked service.
+type network struct {
+	NetworkIn  float64
+	NetworkOut float64
+}
 type EC2DescribeInstancesAPI interface {
 	DescribeInstances(ctx context.Context,
 		params *ec2.DescribeInstancesInput,
 		optFns ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
 }
 
-// GetInstances retrieves information about your Amazon Elastic Compute Cloud (Amazon EC2) instances.
-// Inputs:
-//     c is the context of the method call, which includes the AWS Region.
-//     api is the interface that defines the method call.
-//     input defines the input arguments to the service call.
-// Output:
-//     If success, a DescribeInstancesOutput object containing the result of the service call and nil.
-//     Otherwise, nil and an error from the call to DescribeInstances.
 func GetInstances(c context.Context, api EC2DescribeInstancesAPI, input *ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error) {
 	return api.DescribeInstances(c, input)
 }
@@ -146,48 +146,68 @@ func CloudWatchClient(region string) *cloudwatch.Client {
 	return client
 }
 
+func worker(region string, instanceId string, cldWclt *cloudwatch.Client, result sync.Map) {
+	networkin := createInput(startTime, endTime, id, namespace, "NetworkIn", dimensionName, instanceId, period, stat)
+	networkout := createInput(startTime, endTime, id, namespace, "NetworkOut", dimensionName, instanceId, period, stat)
+	//DebugInput("networIn request", networkin)
+	//DebugInput("networOut request", networkout)
+	//time.Sleep(5 * time.Second)
+	// not sure how to solve the api Throttling problem yet
+	resultin, err1 := GetMetrics(context.TODO(), cldWclt, networkin)
+	resultout, err2 := GetMetrics(context.TODO(), cldWclt, networkout)
+	if err1 != nil || err2 != nil {
+		fmt.Printf("Could not fetch metric data %v, %v", err1, err2)
+	} else {
+		//DebugOutput("Query Results", resultin)
+		//DebugOutput("Query Results", resultout)
+		sumin := 0.0
+		for _, data := range resultin.MetricDataResults[0].Values {
+			sumin += data
+		}
+
+		sumout := 0.0
+		for _, data := range resultout.MetricDataResults[0].Values {
+			sumout += data
+		}
+		result.Store(instanceId, network{float64(sumin / 1024 / 1024 / 1024), float64(sumout / 1024 / 1024 / 1024)})
+		//fmt.Printf("instantId: %s total NetworkIn %f GiB NetworkOut %f GiB\n", instanceId, float64(sumin/1024/1024/1024), float64(sumout/1024/1024/1024))
+	}
+}
+
 func main() {
+	var sm sync.Map
+	var done sync.WaitGroup
 	regions := []string{"us-west-2", "us-east-1"}
 	for _, region := range regions {
 		instances := DescribeInstancesCmd(region)
 		fmt.Printf("total EC2 instances %d in region %s \n", len(instances), region)
-
 		client := CloudWatchClient(region)
-
-		startTime := aws.Time(time.Unix(time.Now().Add(time.Duration(-diffInMinutes)*time.Minute).Unix(), 0))
-		endTime := aws.Time(time.Unix(time.Now().Unix(), 0))
-		fmt.Printf("Request startTime %v endTime %v \n", startTime, endTime)
 
 		//instances = []string{"i-0145c907e4d8ff74c"}
 
 		for _, v := range instances {
-			dimensionValue := v
-			networkin := createInput(startTime, endTime, id, namespace, "NetworkIn", dimensionName, dimensionValue, period, stat)
-			networkout := createInput(startTime, endTime, id, namespace, "NetworkOut", dimensionName, dimensionValue, period, stat)
-
-			//DebugInput("Metrics query", networkin)
-			//DebugInput("Metrics query", networkout)
-
-			resultin, err1 := GetMetrics(context.TODO(), client, networkin)
-			resultout, err2 := GetMetrics(context.TODO(), client, networkout)
-			if err1 != nil || err2 != nil {
-				fmt.Println("Could not fetch metric data")
-			} else {
-				//DebugOutput("Query Results", resultin)
-				//DebugOutput("Query Results", resultout)
-				sumin := 0.0
-				for _, data := range resultin.MetricDataResults[0].Values {
-					sumin += data
-				}
-
-				sumout := 0.0
-				for _, data := range resultout.MetricDataResults[0].Values {
-					sumout += data
-				}
-				fmt.Printf("instantId: %s total NetworkIn %f GiB NetworkOut %f GiB\n", dimensionValue, float64(sumin/1024/1024/1024), float64(sumout/1024/1024/1024))
-			}
+			done.Add(1)
+			v2 := v
+			go func() {
+				defer done.Done()
+				worker(region, v2, client, sm)
+			}()
 		}
 	}
+	done.Wait()
+
+	m := map[string]interface{}{}
+	sm.Range(func(key, value interface{}) bool {
+		m[fmt.Sprint(key)] = value
+		return true
+	})
+
+	b, err := json.MarshalIndent(m, "", "    ")
+	if err != nil {
+		fmt.Println("something wrong")
+	}
+
+	fmt.Printf("final -> %s", string(b))
 
 }
 
