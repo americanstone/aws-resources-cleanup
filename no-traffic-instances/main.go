@@ -14,6 +14,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 )
 
+var id string
+var stat string
+var namespace string
+var dimensionName string
+var diffInMinutes int
+var period int
+
+func init() {
+	id = "inst"
+	stat = "Sum"
+	namespace = "AWS/EC2"
+	dimensionName = "InstanceId"
+	diffInMinutes = 10800 // minutes 7.5 days
+	period = 86400        // 24 hours
+}
+
 // EC2DescribeInstancesAPI defines the interface for the DescribeInstances function.
 // We use this interface to test the function using a mocked service.
 type EC2DescribeInstancesAPI interface {
@@ -119,24 +135,25 @@ func DebugOutput(goal string, data *cloudwatch.GetMetricDataOutput) {
 
 	fmt.Printf("%s %v\n", goal, string(b))
 }
+func CloudWatchClient(region string) *cloudwatch.Client {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	cfg.Region = region
+	if err != nil {
+		panic("configuration error, " + err.Error())
+	}
+
+	client := cloudwatch.NewFromConfig(cfg)
+	return client
+}
 
 func main() {
-	id := "inst"
-	stat := "Sum"
-	namespace := "AWS/EC2"
-	dimensionName := "InstanceId"
-	diffInMinutes := 10800 // minutes 7.5 days
-	period := 86400        // 24 hours
 	regions := []string{"us-west-2", "us-east-1"}
 	for _, region := range regions {
 		instances := DescribeInstancesCmd(region)
 		fmt.Printf("total EC2 instances %d in region %s \n", len(instances), region)
-		cfg, err := config.LoadDefaultConfig(context.TODO())
-		if err != nil {
-			panic("configuration error, " + err.Error())
-		}
 
-		client := cloudwatch.NewFromConfig(cfg)
+		client := CloudWatchClient(region)
+
 		startTime := aws.Time(time.Unix(time.Now().Add(time.Duration(-diffInMinutes)*time.Minute).Unix(), 0))
 		endTime := aws.Time(time.Unix(time.Now().Unix(), 0))
 		fmt.Printf("Request startTime %v endTime %v \n", startTime, endTime)
